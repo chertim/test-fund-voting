@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DAO Fund</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.7.0/dist/ethers.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    h2 { font-size: 1rem; margin-top: 1.5rem; }
+    input, button, select { width: 100%; padding: 0.75rem; margin: 0.5rem 0; font-size: 1rem; }
+    button { background: #3b82f6; color: white; border: none; cursor: pointer; border-radius: 6px; }
+    button:hover { background: #2563eb; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    button.secondary { background: #64748b; }
+    .box { margin-top: 1rem; padding: 1rem; background: #f1f5f9; border-radius: 6px; }
+    .error { color: #dc2626; }
+    .success { color: #16a34a; }
+    .wallet { font-size: 0.85rem; color: #64748b; word-break: break-all; }
+    .proposal-card { margin: 0.75rem 0; padding: 1rem; background: white; border-radius: 6px; border: 1px solid #e2e8f0; }
+    .proposal-card h3 { margin: 0 0 0.5rem 0; font-size: 1rem; }
+    .proposal-card .meta { font-size: 0.85rem; color: #64748b; margin-bottom: 0.5rem; }
+    .proposal-card .btns { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .proposal-card button { width: auto; margin: 0; }
+  </style>
+</head>
+<body>
+  <h1>DAO Fund</h1>
+  <p>Сеть: Sepolia</p>
+
+  <button id="connectBtn">Подключить кошелёк</button>
+  <p id="wallet" class="wallet"></p>
+
+  <label>Адрес Fund:</label>
+  <input type="text" id="fundAddress" placeholder="0x...">
+
+  <label>Адрес DAOGovernance:</label>
+  <input type="text" id="govAddress" placeholder="0x...">
+
+  <button id="checkSetupBtn">Проверить настройку</button>
+  <div id="setupResult" class="box"></div>
+  <p style="font-size:0.8rem;color:#64748b;">Если execute не срабатывает: Remix → DAOGovernance → execute(0) → transact</p>
+
+  <h2>Портфель</h2>
+  <button id="portfolioBtn">Показать портфель</button>
+  <div id="portfolioResult" class="box"></div>
+
+  <h2>Выход из фонда</h2>
+  <p style="font-size:0.9rem;color:#64748b;">Без голосования. DFUND сжигается, FST возвращается 1:1.</p>
+  <button id="withdrawBtn" disabled>Выйти из фонда (вывести все DFUND)</button>
+  <div id="withdrawResult" class="box"></div>
+
+  <h2>Голосование</h2>
+  <button id="createProposalBtn" disabled>Создать предложение: смена стратегии 50/50</button>
+  <button id="createCloseBtn" disabled>Создать предложение: расформирование фонда</button>
+
+  <button id="refreshProposalsBtn" disabled>Обновить список предложений</button>
+  <div id="executeBanner" style="display:none; margin:0.5rem 0; padding:1rem; background:#dcfce7; border-radius:6px; border:1px solid #22c55e;">
+    <strong>Готово к исполнению.</strong>
+    <p id="executeStatus" style="margin:0.5rem 0 0 0; font-size:0.9rem;"></p>
+    <button type="button" id="executeTopBtn" style="margin-top:0.5rem; background:#16a34a;">Выполнить предложение</button>
+  </div>
+  <div id="proposalsList" class="box"></div>
+
+  <div id="voteResult" class="box"></div>
+
+  <script>
+    const FUND_ABI = [
+      "function getPortfolio() view returns (uint256 _stocks, uint256 _bonds)",
+      "function withdraw(uint256 amount)",
+      "function fundToken() view returns (address)",
+      "function governance() view returns (address)"
+    ];
+    const FUND_TOKEN_ABI = [
+      "function balanceOf(address) view returns (uint256)",
+      "function totalSupply() view returns (uint256)",
+      "function approve(address spender, uint256 amount) returns (bool)"
+    ];
+    const GOV_ABI = [
+      "function createProposal(uint8 _type, bytes calldata _extraData) returns (uint256)",
+      "function vote(uint256 proposalId, bool support)",
+      "function execute(uint256 proposalId)",
+      "function getProposal(uint256 id) view returns (uint8 proposalType, uint256 votesFor, uint256 votesAgainst, uint256 totalSupplyAtCreation, uint256 deadline, bool executed, bool rejected)",
+      "function proposalCount() view returns (uint256)"
+    ];
+    const EXTRA_DATA_50_50 = "0x00000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000032";
+    const SEPOLIA_CHAIN_ID = "0xaa36a7";
+
+    let provider, signer;
+    let pendingAutoExecute = null;
+
+    const connectBtn = document.getElementById("connectBtn");
+    const walletEl = document.getElementById("wallet");
+    const portfolioBtn = document.getElementById("portfolioBtn");
+    const portfolioResult = document.getElementById("portfolioResult");
+    const createProposalBtn = document.getElementById("createProposalBtn");
+    const createCloseBtn = document.getElementById("createCloseBtn");
+    const refreshProposalsBtn = document.getElementById("refreshProposalsBtn");
+    const proposalsList = document.getElementById("proposalsList");
+    const voteResult = document.getElementById("voteResult");
+    const withdrawBtn = document.getElementById("withdrawBtn");
+    const withdrawResult = document.getElementById("withdrawResult");
+    const checkSetupBtn = document.getElementById("checkSetupBtn");
+    const setupResult = document.getElementById("setupResult");
+    const executeBanner = document.getElementById("executeBanner");
+    const executeTopBtn = document.getElementById("executeTopBtn");
+    const executeStatus = document.getElementById("executeStatus");
+
+    connectBtn.onclick = async () => {
+      try {
+        provider = new ethers.BrowserProvider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        const network = await provider.getNetwork();
+        if (network.chainId !== 11155111n) {
+          await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_CHAIN_ID }] });
+        }
+        signer = await provider.getSigner();
+        const addr = await signer.getAddress();
+        walletEl.textContent = "Подключено: " + addr.slice(0, 6) + "..." + addr.slice(-4);
+        connectBtn.textContent = "Кошелёк подключён";
+        connectBtn.disabled = true;
+        createProposalBtn.disabled = false;
+        createCloseBtn.disabled = false;
+        refreshProposalsBtn.disabled = false;
+        withdrawBtn.disabled = false;
+        loadProposals();
+      } catch (e) {
+        voteResult.innerHTML = '<span class="error">Ошибка: ' + (e.message || e) + '</span>';
+      }
+    };
+
+    function getGovContract() {
+      const addr = document.getElementById("govAddress").value.trim();
+      if (!addr) throw new Error("Введите адрес DAOGovernance");
+      return new ethers.Contract(addr, GOV_ABI, signer);
+    }
+
+    function getFundContract() {
+      const addr = document.getElementById("fundAddress").value.trim();
+      if (!addr) throw new Error("Введите адрес Fund");
+      return new ethers.Contract(addr, FUND_ABI, provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org"));
+    }
+
+    function getFundContractWithSigner() {
+      const addr = document.getElementById("fundAddress").value.trim();
+      if (!addr) throw new Error("Введите адрес Fund");
+      return new ethers.Contract(addr, FUND_ABI, signer);
+    }
+
+    portfolioBtn.onclick = async () => {
+      const resultEl = portfolioResult;
+      try {
+        resultEl.textContent = "Загрузка...";
+        const contract = getFundContract();
+        const [stocks, bonds] = await contract.getPortfolio();
+        resultEl.innerHTML = '<span class="success"><strong>Портфель:</strong> Акции ' + stocks.toString() + '%, Облигации ' + bonds.toString() + '%</span>';
+      } catch (e) {
+        resultEl.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+
+    refreshProposalsBtn.onclick = () => loadProposals();
+
+    proposalsList.addEventListener("click", function(e) {
+      const btn = e.target.closest(".btn-execute");
+      if (btn && !btn.disabled) {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.disabled = true;
+        const id = parseInt(btn.dataset.executeId, 10);
+        doExecuteProposal(id).finally(() => { btn.disabled = false; });
+      }
+    });
+
+    checkSetupBtn.onclick = async () => {
+      try {
+        const fundAddr = document.getElementById("fundAddress").value.trim();
+        const govAddr = document.getElementById("govAddress").value.trim();
+        if (!fundAddr || !govAddr) {
+          setupResult.innerHTML = '<span class="error">Введите адреса Fund и DAOGovernance</span>';
+          return;
+        }
+        setupResult.textContent = "Проверка...";
+        const fund = getFundContract();
+        const fundGov = await fund.governance();
+        if (fundGov === "0x0000000000000000000000000000000000000000" || fundGov.toLowerCase() !== govAddr.toLowerCase()) {
+          setupResult.innerHTML = '<span class="error"><strong>Fund не настроен.</strong> В Remix: Fund → setGovernance → ' + govAddr + '</span>';
+        } else {
+          setupResult.innerHTML = '<span class="success">Настройка корректна</span>';
+        }
+      } catch (e) {
+        setupResult.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+
+    withdrawBtn.onclick = async () => {
+      try {
+        withdrawResult.textContent = "Отправка транзакции...";
+        const fund = getFundContractWithSigner();
+        const fundTokenAddr = await fund.fundToken();
+        const fundToken = new ethers.Contract(fundTokenAddr, FUND_TOKEN_ABI, signer);
+        const fundAddr = document.getElementById("fundAddress").value.trim();
+        const balance = await fundToken.balanceOf(await signer.getAddress());
+        if (balance === 0n) {
+          withdrawResult.innerHTML = '<span class="error">Нет DFUND для вывода</span>';
+          return;
+        }
+        const approveTx = await fundToken.approve(fundAddr, balance);
+        await approveTx.wait();
+        withdrawResult.textContent = "Approve подтверждён. Вывожу...";
+        const withdrawTx = await fund.withdraw(balance);
+        await withdrawTx.wait();
+        const amount = (Number(balance) / 1e18).toFixed(4);
+        withdrawResult.innerHTML = '<span class="success">Выход выполнен. Получено ' + amount + ' FST</span>';
+      } catch (e) {
+        withdrawResult.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+
+    async function loadProposals() {
+      const listEl = proposalsList;
+      try {
+        if (!document.getElementById("govAddress").value.trim()) {
+          listEl.innerHTML = '<span>Введите адрес DAOGovernance</span>';
+          return;
+        }
+        if (!document.getElementById("fundAddress").value.trim()) {
+          listEl.innerHTML = '<span>Введите адрес Fund</span>';
+          return;
+        }
+        listEl.textContent = "Загрузка...";
+        const gov = getGovContract();
+        const count = Number(await gov.proposalCount());
+        if (count === 0) {
+          listEl.innerHTML = '<span class="success">Нет предложений</span>';
+          return;
+        }
+        const fund = getFundContract();
+        const fundTokenAddr = await fund.fundToken();
+        const fundToken = new ethers.Contract(fundTokenAddr, FUND_TOKEN_ABI, provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org"));
+        const currentSupply = await fundToken.totalSupply();
+
+        let pendingExecuteId = null;
+        let html = "";
+        for (let i = count - 1; i >= 0; i--) {
+          const p = await gov.getProposal(i);
+          const typeNum = Number(p.proposalType);
+          const typeName = typeNum === 0 ? "Смена стратегии 50/50" : "Расформирование фонда";
+          const votesFor = p.votesFor.toString();
+          const total = currentSupply.toString();
+          const executed = p.executed;
+          const rejected = p.rejected;
+          const unanimous = p.votesFor === currentSupply && Number(p.votesAgainst) === 0;
+
+          let status = "Активно";
+          if (executed) status = "Выполнено";
+          else if (rejected) status = "Отклонено";
+          else if (unanimous) status = "Готово к исполнению";
+
+          html += '<div class="proposal-card" data-id="' + i + '">';
+          html += '<h3>' + typeName + '</h3>';
+          html += '<div class="meta">' + votesFor + ' / ' + total + ' голосов · ' + status + '</div>';
+          if (!executed && !rejected) {
+            html += '<div class="btns">';
+            html += '<button onclick="voteProposal(' + i + ', true)">Проголосовать «За»</button>';
+            html += '<button class="secondary" onclick="voteProposal(' + i + ', false)">Проголосовать «Против»</button>';
+            const canExecute = p.votesFor === currentSupply && Number(p.votesAgainst) === 0;
+            if (canExecute) {
+              html += '<button type="button" class="btn-execute" data-execute-id="' + i + '">Выполнить (все проголосовали)</button>';
+              pendingAutoExecute = { id: i };
+              pendingExecuteId = i;
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+        listEl.innerHTML = html || '<span class="success">Нет активных предложений</span>';
+        executeBanner.style.display = pendingExecuteId !== null ? "block" : "none";
+        if (pendingExecuteId !== null) {
+          executeTopBtn.disabled = false;
+          executeTopBtn.onclick = () => {
+            executeTopBtn.disabled = true;
+            doExecuteProposal(pendingExecuteId).finally(() => { executeTopBtn.disabled = false; });
+          };
+        } else {
+          executeTopBtn.onclick = null;
+        }
+        if (pendingAutoExecute) {
+          const { id } = pendingAutoExecute;
+          pendingAutoExecute = null;
+          setTimeout(() => doExecuteProposal(id), 500);
+        }
+      } catch (e) {
+        listEl.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    }
+
+    window.voteProposal = async function(id, support) {
+      try {
+        voteResult.textContent = "Отправка транзакции...";
+        const gov = getGovContract();
+        const tx = await gov.vote(id, support);
+        await tx.wait();
+        const p = await gov.getProposal(id);
+        const fund = getFundContract();
+        const fundTokenAddr = await fund.fundToken();
+        const fundToken = new ethers.Contract(fundTokenAddr, FUND_TOKEN_ABI, provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org"));
+        const currentSupply = await fundToken.totalSupply();
+        const unanimous = p.votesFor === currentSupply && Number(p.votesAgainst) === 0 && !p.executed && !p.rejected;
+        if (unanimous && support) {
+          voteResult.textContent = "Все проголосовали «За». Выполняю...";
+          const execTx = await gov.execute(id);
+          await execTx.wait();
+          voteResult.innerHTML = '<span class="success">Предложение выполнено</span>';
+        } else if (support) {
+          voteResult.innerHTML = '<span class="success">Голос «За» учтён</span>';
+        } else {
+          voteResult.innerHTML = '<span class="error">Голос «Против» — предложение отклонено</span>';
+        }
+        loadProposals();
+      } catch (e) {
+        voteResult.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+
+    async function doExecuteProposal(id) {
+      const show = (msg, err) => {
+        if (executeStatus) { executeStatus.textContent = msg; executeStatus.style.color = err ? "#dc2626" : "#166534"; }
+        voteResult.textContent = msg;
+        voteResult.style.color = err ? "#dc2626" : "";
+      };
+      show("Подготовка...", false);
+      try {
+        if (!window.ethereum) {
+          show("Установите MetaMask", true);
+          return;
+        }
+        const fundAddr = document.getElementById("fundAddress").value.trim();
+        const govAddr = document.getElementById("govAddress").value.trim();
+        if (!fundAddr || !govAddr) {
+          show("Введите адреса Fund и DAOGovernance", true);
+          return;
+        }
+        if (!signer) {
+          show("Подключите кошелёк", true);
+          return;
+        }
+        show("Проверка настройки...", false);
+        const fund = getFundContract();
+        const fundGov = await fund.governance();
+        if (!fundGov || fundGov === "0x0000000000000000000000000000000000000000" || fundGov.toLowerCase() !== govAddr.toLowerCase()) {
+          show("Fund не настроен. Remix → Fund → setGovernance", true);
+          return;
+        }
+        show("Откройте MetaMask и подтвердите транзакцию...", false);
+        const gov = getGovContract();
+        const tx = await gov.execute(id);
+        show("Ожидание подтверждения в сети...", false);
+        await tx.wait();
+        show("Предложение выполнено!", false);
+        loadProposals();
+        portfolioBtn.click();
+      } catch (e) {
+        let msg = e.reason || e.shortMessage || e.message || String(e);
+        if (msg.includes("Voting not ended")) {
+          msg = "Развёрнут старый контракт. Подождите 3 дня после создания предложения или передеплойте DAOGovernance (см. README).";
+        } else if (e.data) {
+          msg += " (data: " + (e.data.message || JSON.stringify(e.data)).slice(0, 100) + ")";
+        }
+        show("Ошибка: " + msg, true);
+      }
+    }
+    window.executeProposal = doExecuteProposal;
+
+    createProposalBtn.onclick = async () => {
+      try {
+        voteResult.textContent = "Отправка транзакции...";
+        const gov = getGovContract();
+        const tx = await gov.createProposal(0, EXTRA_DATA_50_50);
+        await tx.wait();
+        voteResult.innerHTML = '<span class="success">Предложение создано</span>';
+        loadProposals();
+      } catch (e) {
+        voteResult.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+
+    createCloseBtn.onclick = async () => {
+      try {
+        voteResult.textContent = "Отправка транзакции...";
+        const gov = getGovContract();
+        const tx = await gov.createProposal(1, "0x");
+        await tx.wait();
+        voteResult.innerHTML = '<span class="success">Предложение о расформировании создано</span>';
+        loadProposals();
+      } catch (e) {
+        voteResult.innerHTML = '<span class="error">' + (e.message || e) + '</span>';
+      }
+    };
+  </script>
+</body>
+</html>
